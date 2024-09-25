@@ -6,12 +6,17 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 
 @Service
 @RequiredArgsConstructor
 public class PointService {
     private final UserPointTable userPointTable;
     private final PointHistoryTable pointHistoryTable;
+    private final ConcurrentHashMap<Long, Lock> userLocks = new ConcurrentHashMap<>();
 
     /**
      * 사용자의 포인트 정보를 조회합니다.
@@ -29,6 +34,57 @@ public class PointService {
      */
     public List<PointHistory> getUserPointHistories(final long userId) {
         return pointHistoryTable.selectAllByUserId(userId);
+    }
+
+    /**
+     * 사용자의 포인트를 충전합니다.
+     * @param userId
+     * @param amount
+     * @return UserPoint
+     */
+    public UserPoint chargeUserPoint(final long userId, final long amount) {
+        Lock lock = userLocks.computeIfAbsent(userId, k -> new ReentrantLock());
+
+        lock.lock();
+        try {
+            UserPoint userPoint = userPointTable.selectById(userId);
+            long newPointAmount = calculateNewPoint(userPoint, amount);
+            UserPoint updatedUserPoint = updateUserPoint(userId, newPointAmount);
+            recordPointHistory(userId, amount);
+            return updatedUserPoint;
+        } finally {
+            lock.unlock();
+            userLocks.remove(userId, lock);
+        }
+    }
+
+    /**
+     * 포인트를 계산합니다.
+     * @param userPoint
+     * @param amount
+     * @return long
+     */
+    private long calculateNewPoint(UserPoint userPoint, long amount) {
+        return userPoint.point() + amount;
+    }
+
+    /**
+     * 사용자 포인트를 업데이트합니다.
+     * @param userId
+     * @param newPointAmount
+     * @return UserPoint
+     */
+    private UserPoint updateUserPoint(long userId, long newPointAmount) {
+        return userPointTable.insertOrUpdate(userId, newPointAmount);
+    }
+
+    /**
+     * 포인트 충전 내역을 기록합니다.
+     * @param userId
+     * @param amount
+     */
+    private void recordPointHistory(long userId, long amount) {
+        pointHistoryTable.insert(userId, amount, TransactionType.CHARGE, System.currentTimeMillis());
     }
 
 }
