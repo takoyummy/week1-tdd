@@ -12,7 +12,7 @@ public class PointService {
     /**
      * 사용자의 포인트 정보를 조회합니다.
      * @param userId
-     * @return
+     * @return UserPoint
      */
     public UserPoint getUserPoint(final long userId) {
         return userPointTable.selectById(userId);
