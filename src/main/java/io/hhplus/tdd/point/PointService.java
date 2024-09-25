@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service;
 
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -17,6 +16,7 @@ public class PointService {
     private final UserPointTable userPointTable;
     private final PointHistoryTable pointHistoryTable;
     private final ConcurrentHashMap<Long, Lock> userLocks = new ConcurrentHashMap<>();
+    private final PointValidator pointValidator;  // Validator 의존성 추가
 
     /**
      * 사용자의 포인트 정보를 조회합니다.
@@ -48,6 +48,9 @@ public class PointService {
         lock.lock();
         try {
             UserPoint userPoint = userPointTable.selectById(userId);
+
+            pointValidator.validate(userPoint, amount, TransactionType.CHARGE);
+
             long newPointAmount = calculateNewPoint(userPoint, amount);
             UserPoint updatedUserPoint = updateUserPoint(userId, newPointAmount);
             recordPointHistory(userId, amount);
@@ -55,6 +58,32 @@ public class PointService {
         } finally {
             lock.unlock();
             userLocks.remove(userId, lock);
+        }
+    }
+
+    /**
+     * 사용자의 포인트를 사용합니다.
+     * @param userId
+     * @param amount
+     * @return UserPoint
+     */
+    public UserPoint useUserPoint(final long userId, final long amount) {
+        Lock lock = userLocks.computeIfAbsent(userId, k -> new ReentrantLock());
+
+        try {
+            UserPoint userPoint = userPointTable.selectById(userId);
+
+            // 유효성 검사, 실패 시 예외 발생
+            pointValidator.validate(userPoint, amount, TransactionType.USE);
+
+            long newPointAmount = userPoint.point() - amount;
+            UserPoint updatedUserPoint = userPointTable.insertOrUpdate(userId, newPointAmount);
+            pointHistoryTable.insert(userId, amount, TransactionType.USE, System.currentTimeMillis());
+
+            return updatedUserPoint;
+        } finally {
+            lock.unlock();
+            userLocks.remove(userId);
         }
     }
 
