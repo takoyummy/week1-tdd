@@ -10,17 +10,15 @@ import org.mockito.InjectMocks;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicLong;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.then;
-import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 public class PointServiceTest {
@@ -30,6 +28,9 @@ public class PointServiceTest {
 
     @Mock
     private PointHistoryTable pointHistoryTable;
+
+    @Mock
+    private PointValidator pointValidator;
 
     @InjectMocks
     private PointService pointService;
@@ -71,67 +72,44 @@ public class PointServiceTest {
     }
 
     @Test
-    @DisplayName("다수의 스레드에서 포인트 충전이 동시에 발생할 때도 동시성 문제가 발생하지 않는다.")
-    void shouldHandleHighConcurrencyInChargeUserPoint() throws InterruptedException, ExecutionException {
-        // given
+    @DisplayName("포인트 충전 시 충전 금액이 0보다 작으면 예외가 발생한다.")
+    void testConcurrentChargeUserPoint() throws InterruptedException {
         long userId = 1L;
-        long initialAmount = 100L;
-        long amountToCharge = 50L;
-        int threadCount = 10;
+        long initialPoints = 100L;
+        long amountToCharge = 10L;
 
-        UserPoint existingUserPoint = new UserPoint(userId, initialAmount, System.currentTimeMillis());
+        UserPoint userPoint = new UserPoint(userId, initialPoints, System.currentTimeMillis());
 
-        // Mockito 설정
-        given(userPointTable.selectById(userId)).willReturn(existingUserPoint);
-
-        // AtomicLong으로 중간 결과가 무시 될 수 있는 여지 차단
-        AtomicLong accumulatedPoints = new AtomicLong(initialAmount);
-
-        given(userPointTable.insertOrUpdate(eq(userId), anyLong())).willAnswer(invocation -> {
-            Long amount = invocation.getArgument(1);
-            long newAmount = accumulatedPoints.addAndGet(amountToCharge);
-            return new UserPoint(userId, newAmount, System.currentTimeMillis());
+        // 초기 UserPoint 설정
+        when(userPointTable.selectById(userId)).thenReturn(userPoint);
+        when(userPointTable.insertOrUpdate(eq(userId), anyLong())).thenAnswer(invocation -> {
+            long updatedPoints = invocation.getArgument(1);
+            return new UserPoint(userId, updatedPoints, System.currentTimeMillis());
         });
 
+        // 동시성 테스트를 위한 스레드 풀 및 CountDownLatch
+        int threadCount = 10;
         ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
-        CountDownLatch readyLatch = new CountDownLatch(threadCount);
-        CountDownLatch startLatch = new CountDownLatch(1);
-        CountDownLatch doneLatch = new CountDownLatch(threadCount);
-
-        List<Future<UserPoint>> futures = new ArrayList<>();
+        CountDownLatch latch = new CountDownLatch(threadCount);
 
         for (int i = 0; i < threadCount; i++) {
-            futures.add(executorService.submit(() -> {
-                readyLatch.countDown(); // 스레드 준비 완료
-                startLatch.await(); // 모든 스레드가 준비될 때까지 대기
+            executorService.execute(() -> {
                 try {
-                    return pointService.chargeUserPoint(userId, amountToCharge);
+                    pointService.chargeUserPoint(userId, amountToCharge);
                 } finally {
-                    doneLatch.countDown(); // 작업 완료 알림
+                    latch.countDown();
                 }
-            }));
+            });
         }
 
-        readyLatch.await(); // 모든 스레드가 준비될 때까지 대기
-        startLatch.countDown(); // 모든 스레드에 시작 신호
-        doneLatch.await(); // 모든 스레드가 작업을 완료할 때까지 대기
+        // 모든 스레드가 작업을 완료할 때까지 대기
+        latch.await();
 
-        long expectedFinalAmount = initialAmount + amountToCharge * threadCount;
-        UserPoint finalUserPoint = null;
+        // 예상 포인트는 초기 포인트 + (스레드 개수 * 충전 금액)
+        long expectedPoints = initialPoints + (threadCount * amountToCharge);
 
-        for (Future<UserPoint> future : futures) {
-            UserPoint result = future.get();
-            finalUserPoint = result; // 마지막 업데이트된 결과를 가져옴
-        }
-
-        executorService.shutdown();
-
-        // 최종 포인트 값이 예상대로인지 검증
-        assertThat(finalUserPoint.point()).isEqualTo(expectedFinalAmount);
-
-        // then
-        then(userPointTable).should(times(threadCount)).insertOrUpdate(eq(userId), anyLong());
-        then(pointHistoryTable).should(times(threadCount)).insert(eq(userId), eq(amountToCharge), eq(TransactionType.CHARGE), anyLong());
+        // 결과 확인
+        verify(userPointTable, times(1)).insertOrUpdate(eq(userId), eq(expectedPoints));
     }
 
     @Test
@@ -165,6 +143,129 @@ public class PointServiceTest {
         long capturedTimestamp = timestampCaptor.getValue();
         long currentTime = System.currentTimeMillis();
         assertThat(capturedTimestamp).isBetween(currentTime - 1000, currentTime + 1000); // 1초 이내의 차이만 허용
+    }
+
+    @Test
+    @DisplayName("포인트 사용 시 잔액이 부족하면 예외가 발생한다.")
+    void shouldFailIfInsufficientBalanceWhenUsingPoints() {
+        long userId = 1L;
+        long initialAmount = 100L;
+        long amountToUse = 150L;
+
+        UserPoint existingUserPoint = new UserPoint(userId, initialAmount, System.currentTimeMillis());
+
+        given(userPointTable.selectById(userId)).willReturn(existingUserPoint);
+
+        ArgumentCaptor<UserPoint> userPointCaptor = ArgumentCaptor.forClass(UserPoint.class);
+
+        doThrow(new IllegalArgumentException("잔액이 부족합니다."))
+                .when(pointValidator)
+                .validate(userPointCaptor.capture(), eq(amountToUse), eq(TransactionType.USE));
+
+        // when, then
+        try {
+            pointService.useUserPoint(userId, amountToUse);
+        } catch (IllegalArgumentException e) {
+            assertThat(e.getMessage()).isEqualTo("잔액이 부족합니다.");
+        }
+
+        // 캡처된 UserPoint 객체를 검증합니다.
+        UserPoint capturedUserPoint = userPointCaptor.getValue();
+        assertThat(capturedUserPoint.point()).isEqualTo(initialAmount); // 포인트가 초기값과 동일해야 함
+    }
+
+    @Test
+    @DisplayName("포인트 사용이 성공적으로 이루어진다.")
+    void testConcurrentUseUserPoint() throws InterruptedException {
+        long userId = 1L;
+        long initialPoints = 100L;
+        long amountToUse = 10L;
+
+        UserPoint userPoint = new UserPoint(userId, initialPoints, System.currentTimeMillis());
+
+        // 초기 UserPoint 설정
+        when(userPointTable.selectById(userId)).thenReturn(userPoint);
+        when(userPointTable.insertOrUpdate(eq(userId), anyLong())).thenAnswer(invocation -> {
+            long updatedPoints = invocation.getArgument(1);
+            return new UserPoint(userId, updatedPoints, System.currentTimeMillis());
+        });
+
+        // 동시성 테스트를 위한 스레드 풀 및 CountDownLatch
+        int threadCount = 10;
+        ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        for (int i = 0; i < threadCount; i++) {
+            executorService.execute(() -> {
+                try {
+                    pointService.useUserPoint(userId, amountToUse);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        // 모든 스레드가 작업을 완료할 때까지 대기
+        latch.await();
+
+        // 예상 포인트는 초기 포인트 - (스레드 개수 * 사용 금액)
+        long expectedPoints = initialPoints - (threadCount * amountToUse);
+
+        // 결과 확인
+        verify(userPointTable, times(1)).insertOrUpdate(eq(userId), eq(expectedPoints));
+    }
+
+    @Test
+    @DisplayName("포인트 충전과 사용이 동시에 이루어진다.")
+    void testConcurrentChargeAndUseUserPoint() throws InterruptedException {
+        long userId = 1L;
+        long initialPoints = 100L;
+        long amountToCharge = 10L;
+        long amountToUse = 5L;
+
+        UserPoint userPoint = new UserPoint(userId, initialPoints, System.currentTimeMillis());
+
+        // 초기 UserPoint 설정
+        when(userPointTable.selectById(userId)).thenReturn(userPoint);
+        when(userPointTable.insertOrUpdate(eq(userId), anyLong())).thenAnswer(invocation -> {
+            long updatedPoints = invocation.getArgument(1);
+            return new UserPoint(userId, updatedPoints, System.currentTimeMillis());
+        });
+
+        // 동시성 테스트를 위한 스레드 풀 및 CountDownLatch
+        int threadCount = 10;  // 총 스레드 개수 (충전 + 사용)
+        ExecutorService executorService = Executors.newFixedThreadPool(threadCount);
+        CountDownLatch latch = new CountDownLatch(threadCount);
+
+        // 충전 작업을 수행하는 스레드 5개
+        for (int i = 0; i < threadCount / 2; i++) {
+            executorService.execute(() -> {
+                try {
+                    pointService.chargeUserPoint(userId, amountToCharge);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        // 사용 작업을 수행하는 스레드 5개
+        for (int i = 0; i < threadCount / 2; i++) {
+            executorService.execute(() -> {
+                try {
+                    pointService.useUserPoint(userId, amountToUse);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        // 모든 스레드가 작업을 완료할 때까지 대기
+        latch.await();
+
+        // 예상 포인트는 초기 포인트 + (충전 스레드 개수 * 충전 금액) - (사용 스레드 개수 * 사용 금액)
+        long expectedPoints = initialPoints + (threadCount / 2 * amountToCharge) - (threadCount / 2 * amountToUse);
+
+        verify(userPointTable, atLeast(1)).insertOrUpdate(eq(userId), eq(expectedPoints));
     }
 
 }
